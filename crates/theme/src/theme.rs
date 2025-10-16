@@ -19,11 +19,11 @@ mod schema;
 mod settings;
 mod styles;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use ::settings::Settings;
-use ::settings::SettingsStore;
+use ::settings::{Settings, SettingsStore};
 use anyhow::Result;
 use fallback_themes::apply_status_color_defaults;
 use fs::Fs;
@@ -113,7 +113,12 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
 
     let theme = GlobalTheme::configured_theme(cx);
     let icon_theme = GlobalTheme::configured_icon_theme(cx);
-    cx.set_global(GlobalTheme { theme, icon_theme });
+    cx.set_global(GlobalTheme {
+        theme,
+        workspace_themes: HashMap::default(),
+        icon_theme,
+        workspace_icon_themes: HashMap::default(),
+    });
 
     let settings = ThemeSettings::get_global(cx);
 
@@ -442,14 +447,19 @@ pub async fn read_icon_theme(
 /// The active theme
 pub struct GlobalTheme {
     theme: Arc<Theme>,
+    workspace_themes: HashMap<String, Arc<Theme>>,
     icon_theme: Arc<IconTheme>,
+    workspace_icon_themes: HashMap<String, Arc<IconTheme>>,
 }
 impl Global for GlobalTheme {}
 
 impl GlobalTheme {
     fn configured_theme(cx: &mut App) -> Arc<Theme> {
-        let themes = ThemeRegistry::default_global(cx);
-        let theme_settings = ThemeSettings::get_global(cx);
+        Self::configured_theme_for_settings(ThemeSettings::get_global(cx), cx)
+    }
+
+    fn configured_theme_for_settings(theme_settings: &ThemeSettings, cx: &App) -> Arc<Theme> {
+        let themes = ThemeRegistry::global(cx);
         let system_appearance = SystemAppearance::global(cx);
 
         let theme_name = theme_settings.theme.name(*system_appearance);
@@ -475,13 +485,47 @@ impl GlobalTheme {
     /// taking into account the current [`SystemAppearance`].
     pub fn reload_theme(cx: &mut App) {
         let theme = Self::configured_theme(cx);
-        cx.update_global::<Self, _>(|this, _| this.theme = theme);
+
+        // Clone workspace_profile_settings Rc to avoid borrow conflicts
+        let workspace_profiles = {
+            let store = cx.global::<SettingsStore>();
+            store
+                .workspace_profile_settings()
+                .iter()
+                .map(|(name, content)| (name.clone(), content.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // Recompute workspace themes
+        let mut workspace_themes = HashMap::default();
+        let mut workspace_icon_themes = HashMap::default();
+
+        for (profile_name, settings_content) in workspace_profiles {
+            let theme_settings = ThemeSettings::from_settings(settings_content.as_ref());
+            let profile_theme = Self::configured_theme_for_settings(&theme_settings, cx);
+            workspace_themes.insert(profile_name.clone(), profile_theme);
+
+            let icon_theme = Self::configured_icon_theme_for_settings(&theme_settings, cx);
+            workspace_icon_themes.insert(profile_name.clone(), icon_theme);
+        }
+
+        cx.update_global::<Self, _>(|this, _| {
+            this.theme = theme;
+            this.workspace_themes = workspace_themes;
+            this.workspace_icon_themes = workspace_icon_themes;
+        });
         cx.refresh_windows();
     }
 
     fn configured_icon_theme(cx: &mut App) -> Arc<IconTheme> {
-        let themes = ThemeRegistry::default_global(cx);
-        let theme_settings = ThemeSettings::get_global(cx);
+        Self::configured_icon_theme_for_settings(ThemeSettings::get_global(cx), cx)
+    }
+
+    fn configured_icon_theme_for_settings(
+        theme_settings: &ThemeSettings,
+        cx: &App,
+    ) -> Arc<IconTheme> {
+        let themes = ThemeRegistry::global(cx);
         let system_appearance = SystemAppearance::global(cx);
 
         let icon_theme_name = theme_settings.icon_theme.name(*system_appearance);
@@ -503,7 +547,35 @@ impl GlobalTheme {
     /// taking into account the current [`SystemAppearance`].
     pub fn reload_icon_theme(cx: &mut App) {
         let icon_theme = Self::configured_icon_theme(cx);
-        cx.update_global::<Self, _>(|this, _| this.icon_theme = icon_theme);
+
+        // Clone workspace_profile_settings Rc to avoid borrow conflicts
+        let workspace_profiles = {
+            let store = cx.global::<SettingsStore>();
+            store
+                .workspace_profile_settings()
+                .iter()
+                .map(|(name, content)| (name.clone(), content.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // Recompute workspace themes
+        let mut workspace_themes = HashMap::default();
+        let mut workspace_icon_themes = HashMap::default();
+
+        for (profile_name, settings_content) in workspace_profiles {
+            let theme_settings = ThemeSettings::from_settings(settings_content.as_ref());
+            let profile_theme = Self::configured_theme_for_settings(&theme_settings, cx);
+            workspace_themes.insert(profile_name.clone(), profile_theme);
+
+            let profile_icon_theme = Self::configured_icon_theme_for_settings(&theme_settings, cx);
+            workspace_icon_themes.insert(profile_name.clone(), profile_icon_theme);
+        }
+
+        cx.update_global::<Self, _>(|this, _| {
+            this.icon_theme = icon_theme;
+            this.workspace_themes = workspace_themes;
+            this.workspace_icon_themes = workspace_icon_themes;
+        });
         cx.refresh_windows();
     }
 
@@ -512,8 +584,24 @@ impl GlobalTheme {
         &cx.global::<Self>().theme
     }
 
+    /// Get theme for a specific workspace profile name
+    pub fn theme_for_workspace_profile<'a>(
+        profile_name: &str,
+        cx: &'a App,
+    ) -> Option<&'a Arc<Theme>> {
+        cx.global::<Self>().workspace_themes.get(profile_name)
+    }
+
     /// the active icon theme
     pub fn icon_theme(cx: &App) -> &Arc<IconTheme> {
         &cx.global::<Self>().icon_theme
+    }
+
+    /// Get icon theme for a specific workspace profile name
+    pub fn icon_theme_for_workspace_profile<'a>(
+        profile_name: &str,
+        cx: &'a App,
+    ) -> Option<&'a Arc<IconTheme>> {
+        cx.global::<Self>().workspace_icon_themes.get(profile_name)
     }
 }

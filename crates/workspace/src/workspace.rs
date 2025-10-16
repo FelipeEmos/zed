@@ -425,6 +425,10 @@ actions!(
     ]
 );
 
+thread_local! {
+    static ACTIVE_WORKSPACE_THEME: RefCell<Option<(Arc<theme::Theme>, Arc<theme::IconTheme>)>> = RefCell::new(None);
+}
+
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum PathMatch {
     /// Exact path match
@@ -1149,6 +1153,7 @@ pub struct Workspace {
     active_call: Option<(Entity<ActiveCall>, Vec<Subscription>)>,
     leader_updates_tx: mpsc::UnboundedSender<(PeerId, proto::UpdateFollowers)>,
     database_id: Option<WorkspaceId>,
+    active_workspace_profile_name: Option<String>,
     app_state: Arc<AppState>,
     dispatching_keystrokes: Rc<RefCell<DispatchingKeystrokes>>,
     _subscriptions: Vec<Subscription>,
@@ -1458,6 +1463,7 @@ impl Workspace {
         ];
 
         cx.defer_in(window, |this, window, cx| {
+            this.resolve_active_workspace_profile(cx);
             this.update_window_title(window, cx);
             this.show_initial_notifications(cx);
         });
@@ -1490,6 +1496,7 @@ impl Workspace {
             dirty_items: Default::default(),
             active_call,
             database_id: workspace_id,
+            active_workspace_profile_name: None,
             app_state,
             _observe_current_user,
             _apply_leader_updates,
@@ -5232,6 +5239,73 @@ impl Workspace {
         None
     }
 
+    pub fn effective_settings_content<'a>(&self, cx: &'a App) -> &'a Rc<settings::SettingsContent> {
+        let store = cx.global::<settings::SettingsStore>();
+
+        if let Some(ref profile_name) = self.active_workspace_profile_name {
+            if let Some(settings) = store.workspace_profile_settings().get(profile_name) {
+                return settings;
+            }
+        }
+
+        store.merged_settings()
+    }
+
+    fn resolve_active_workspace_profile(&mut self, cx: &mut Context<Self>) {
+        self.active_workspace_profile_name = self.database_id.and_then(|_| {
+            let store = cx.global::<settings::SettingsStore>();
+            let user_settings = store.raw_user_settings()?;
+
+            self.winning_workspace_profile(&user_settings.workspace_profiles, cx)
+                .map(|(name, _)| name.to_string())
+        });
+    }
+
+    /// Get the theme for this workspace, using workspace profile if available
+    pub fn theme<'a>(&self, cx: &'a App) -> &'a Arc<theme::Theme> {
+        if let Some(ref profile_name) = self.active_workspace_profile_name {
+            if let Some(theme) = theme::GlobalTheme::theme_for_workspace_profile(profile_name, cx) {
+                return theme;
+            }
+        }
+        theme::GlobalTheme::theme(cx)
+    }
+
+    /// Get the icon theme for this workspace, using workspace profile if available
+    pub fn icon_theme<'a>(&self, cx: &'a App) -> &'a Arc<theme::IconTheme> {
+        if let Some(ref profile_name) = self.active_workspace_profile_name {
+            if let Some(icon_theme) =
+                theme::GlobalTheme::icon_theme_for_workspace_profile(profile_name, cx)
+            {
+                return icon_theme;
+            }
+        }
+        theme::GlobalTheme::icon_theme(cx)
+    }
+
+    /// Get the active workspace theme from thread-local context
+    /// This should be used instead of cx.theme() when rendering workspace content
+    pub fn active_theme(cx: &App) -> Arc<theme::Theme> {
+        ACTIVE_WORKSPACE_THEME.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .map(|(theme, _)| theme.clone())
+                .unwrap_or_else(|| theme::GlobalTheme::theme(cx).clone())
+        })
+    }
+
+    /// Get the active workspace icon theme from thread-local context
+    pub fn active_icon_theme(cx: &App) -> Arc<theme::IconTheme> {
+        ACTIVE_WORKSPACE_THEME.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .map(|(_, icon_theme)| icon_theme.clone())
+                .unwrap_or_else(|| theme::GlobalTheme::icon_theme(cx).clone())
+        })
+    }
+
     fn remove_panes(&mut self, member: Member, window: &mut Window, cx: &mut Context<Workspace>) {
         match member {
             Member::Axis(PaneAxis { members, .. }) => {
@@ -6385,6 +6459,12 @@ impl Render for DraggedDock {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Set the active workspace theme for this render
+        let workspace_theme = self.theme(cx).clone();
+        let workspace_icon_theme = self.icon_theme(cx).clone();
+        ACTIVE_WORKSPACE_THEME.with(|active| {
+            *active.borrow_mut() = Some((workspace_theme, workspace_icon_theme));
+        });
         let mut context = KeyContext::new_with_defaults();
         context.add("Workspace");
         context.set("keyboard_layout", cx.keyboard_layout().name().to_string());
@@ -6425,7 +6505,7 @@ impl Render for Workspace {
         };
         let ui_font = theme::setup_ui_font(window, cx);
 
-        let theme = cx.theme().clone();
+        let theme = self.theme(cx).clone();
         let colors = theme.colors();
         let notification_entities = self
             .notifications
